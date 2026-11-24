@@ -91,6 +91,10 @@ interface FillInfo {
 const history = new Map<string, { slot: number; rq: bigint }[]>();
 /** Mints a buy was ever sent for (closer or probe): no re-entry. */
 const bought = new Set<string>();
+/** Mints whose closer gate has held once: each coin is decided a single time,
+ *  on the first batch its gate holds — if no slot or cash is free then, it
+ *  is skipped for good rather than retried while the gate holds. */
+const decided = new Set<string>();
 /** Mints bought as probes (they sell back at once). */
 const probeMints = new Set<string>();
 /** Mints with a filled buy, with the fill's price and slot. */
@@ -224,7 +228,9 @@ await runBot({
     }
 
     // 4. Closer entries: buy once per coin, on the first batch the gate
-    //    holds. Skip mints already bought or with a buy in flight.
+    //    holds. A coin whose gate holds while no slot or cash is free is
+    //    decided and skipped for good, not retried. Skip mints already
+    //    bought or with a buy in flight.
     const seenThisBatch = new Set<string>();
     for (const e of batch.events) {
       const mint = e.mint;
@@ -238,6 +244,8 @@ await runBot({
       if (curve.real_quote_reserves < ENTRY_MIN_RQ) continue;
       const vel = velocity(mint, slot, curve.real_quote_reserves);
       if (vel === null || vel < VELOCITY_MIN) continue;
+      if (decided.has(mint)) continue;
+      decided.add(mint);
       const cap = state.maxBuyLamports(mint);
       const size = cap < CLOSER_STAKE ? cap : CLOSER_STAKE;
       if (size <= 0n) continue;
