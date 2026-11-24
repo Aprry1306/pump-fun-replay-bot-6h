@@ -73,10 +73,12 @@ const MAX_SLIPPAGE_BPS = 10_000;
 // ---- the bot's own books ----
 
 interface FillInfo {
-  /** SOL spent on the buy, fees included. */
-  fillQuote: bigint;
-  /** Tokens received on the buy. */
-  fillTokens: bigint;
+  /** The curve's virtual reserves when the buy fill landed: the fill price
+   *  is vq0/vt0, the marginal price at the fill, not the average execution
+   *  price (which bakes in the buy's own curve impact and its fees). TP/SL
+   *  compare the current marginal price against it. */
+  vq0: bigint;
+  vt0: bigint;
   /** Slot the buy filled at (timeout counts from here). */
   fillSlot: number;
   kind: 'closer' | 'probe';
@@ -149,9 +151,11 @@ await runBot({
     //    since the position is still held and nothing is in flight for it.
     for (const f of batch.fills) {
       if (f.side === 'buy' && f.status === 'filled') {
+        // The fill price is the curve's marginal price as the fill lands.
+        const curve = state.curves.get(f.mint);
         filled.set(f.mint, {
-          fillQuote: BigInt(f.quote_lamports),
-          fillTokens: BigInt(f.token_amount),
+          vq0: curve === undefined ? BigInt(f.quote_lamports) : curve.virtual_quote_reserves,
+          vt0: curve === undefined ? BigInt(f.token_amount) : curve.virtual_token_reserves,
           fillSlot: f.slot,
           kind: probeMints.has(f.mint) ? 'probe' : 'closer',
         });
@@ -185,7 +189,7 @@ await runBot({
     //    already in flight, and never sell a completed curve (the harness
     //    force-closes it). Prices compare in bigint, no division: the
     //    current price is virtual_quote/virtual_token, the fill price is
-    //    fillQuote/fillTokens.
+    //    the same ratio as the buy fill landed (info.vq0/info.vt0).
     for (const [mint, holding] of state.positions) {
       if (sellInFlight.has(mint)) continue;
       const curve = state.curves.get(mint);
@@ -197,12 +201,12 @@ await runBot({
         exit = true;
       } else if (slot - info.fillSlot >= HOLD_TIMEOUT_SLOTS) {
         exit = true;
-      } else if (curve.virtual_token_reserves > 0n) {
+      } else if (curve.virtual_token_reserves > 0n && info.vt0 > 0n) {
         const vq = curve.virtual_quote_reserves;
         const vt = curve.virtual_token_reserves;
-        if (vq * info.fillTokens * TAKE_PROFIT_DEN >= TAKE_PROFIT_NUM * info.fillQuote * vt) {
+        if (vq * info.vt0 * TAKE_PROFIT_DEN >= TAKE_PROFIT_NUM * info.vq0 * vt) {
           exit = true; // at or above 2x the fill price
-        } else if (vq * info.fillTokens * STOP_LOSS_DEN <= STOP_LOSS_NUM * info.fillQuote * vt) {
+        } else if (vq * info.vt0 * STOP_LOSS_DEN <= STOP_LOSS_NUM * info.vq0 * vt) {
           exit = true; // at or below 0.75x the fill price
         }
       }
