@@ -89,12 +89,10 @@ interface FillInfo {
  *  earliest sample is the velocity reference for coins younger than the
  *  window, and overwriting same-slot samples would erase the create. */
 const history = new Map<string, { slot: number; rq: bigint }[]>();
-/** Mints a buy was ever sent for (closer or probe): no re-entry. */
+/** Mints with a filled buy (closer or probe): no re-entry. A buy counts only
+ *  once it fills — a rejected or failed buy leaves the mint eligible, and
+ *  the buy-in-flight check keeps a pending buy from doubling. */
 const bought = new Set<string>();
-/** Mints whose closer gate has held once: each coin is decided a single time,
- *  on the first batch its gate holds — if no slot or cash is free then, it
- *  is skipped for good rather than retried while the gate holds. */
-const decided = new Set<string>();
 /** Mints bought as probes (they sell back at once). */
 const probeMints = new Set<string>();
 /** Mints with a filled buy, with the fill's price and slot. */
@@ -149,14 +147,16 @@ await runBot({
     }
 
     // 1. Fold this batch's fills into the books. A filled buy records its
-    //    price and slot; a filled sell (ours or a harness close) closes the
-    //    round trip. A rejected or failed buy is never retried (the mint is
-    //    already in `bought`); a rejected or failed sell is retried below,
-    //    since the position is still held and nothing is in flight for it.
+    //    price and slot, and counts the mint as bought; a filled sell (ours
+    //    or a harness close) closes the round trip. A rejected or failed buy
+    //    leaves the mint unbought, so the gate can try it again later; a
+    //    rejected or failed sell is retried below, since the position is
+    //    still held and nothing is in flight for it.
     for (const f of batch.fills) {
       if (f.side === 'buy' && f.status === 'filled') {
         // The fill price is the curve's marginal price as the fill lands.
         const curve = state.curves.get(f.mint);
+        bought.add(f.mint);
         filled.set(f.mint, {
           vq0: curve === undefined ? BigInt(f.quote_lamports) : curve.virtual_quote_reserves,
           vt0: curve === undefined ? BigInt(f.token_amount) : curve.virtual_token_reserves,
@@ -228,9 +228,7 @@ await runBot({
     }
 
     // 4. Closer entries: buy once per coin, on the first batch the gate
-    //    holds. A coin whose gate holds while no slot or cash is free is
-    //    decided and skipped for good, not retried. Skip mints already
-    //    bought or with a buy in flight.
+    //    holds. Skip mints already bought or with a buy in flight.
     const seenThisBatch = new Set<string>();
     for (const e of batch.events) {
       const mint = e.mint;
@@ -244,8 +242,6 @@ await runBot({
       if (curve.real_quote_reserves < ENTRY_MIN_RQ) continue;
       const vel = velocity(mint, slot, curve.real_quote_reserves);
       if (vel === null || vel < VELOCITY_MIN) continue;
-      if (decided.has(mint)) continue;
-      decided.add(mint);
       const cap = state.maxBuyLamports(mint);
       const size = cap < CLOSER_STAKE ? cap : CLOSER_STAKE;
       if (size <= 0n) continue;
@@ -257,7 +253,6 @@ await runBot({
         quote_lamports: size,
         max_slippage_bps: MAX_SLIPPAGE_BPS,
       });
-      bought.add(mint);
       buyInFlight.add(mint);
       openSlots -= 1;
       free -= size + txFee;
@@ -298,7 +293,6 @@ await runBot({
             quote_lamports: size,
             max_slippage_bps: MAX_SLIPPAGE_BPS,
           });
-          bought.add(best);
           probeMints.add(best);
           buyInFlight.add(best);
           probesSent += 1;
